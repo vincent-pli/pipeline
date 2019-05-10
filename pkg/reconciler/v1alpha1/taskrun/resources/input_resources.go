@@ -19,6 +19,7 @@ package resources
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
@@ -73,6 +74,7 @@ func AddInputResource(
 
 	for _, input := range taskSpec.Inputs.Resources {
 		boundResource, err := getBoundResource(input.Name, taskRun.Spec.Inputs.Resources)
+
 		if err != nil {
 			return nil, fmt.Errorf("Failed to get bound resource: %s", err)
 		}
@@ -90,14 +92,19 @@ func AddInputResource(
 		// if taskrun is fetching resource from previous task then execute copy step instead of fetching new copy
 		// to the desired destination directory, as long as the resource exports output to be copied
 		if allowedOutputResources[resource.Spec.Type] && taskRun.HasPipelineRunOwnerReference() {
+			needSubFolder := len(boundResource.Paths) > 1
 			for _, path := range boundResource.Paths {
-				cpContainers := as.GetCopyFromStorageToContainerSpec(boundResource.Name, path, dPath)
+				dPathSub := dPath
+				if needSubFolder {
+					dPathSub = addSubFoler(path, dPath)
+				}
+				cpContainers := as.GetCopyFromStorageToContainerSpec(boundResource.Name, path, dPathSub)
 				if as.GetType() == v1alpha1.ArtifactStoragePVCType {
 
 					mountPVC = true
 					for _, ct := range cpContainers {
 						ct.VolumeMounts = []corev1.VolumeMount{getPvcMount(pvcName)}
-						createAndCopyContainers := []corev1.Container{v1alpha1.CreateDirContainer(boundResource.Name, dPath), ct}
+						createAndCopyContainers := []corev1.Container{v1alpha1.CreateDirContainer(boundResource.Name, dPathSub), ct}
 						copyStepsFromPrevTasks = append(copyStepsFromPrevTasks, createAndCopyContainers...)
 					}
 				} else {
@@ -208,4 +215,9 @@ func destinationPath(name, path string) string {
 		return filepath.Join(workspaceDir, name)
 	}
 	return filepath.Join(workspaceDir, path)
+}
+
+//Assume the source path from PV is /pvc/previous_task/resource_name
+func addSubFoler(path, dpath string) string {
+	return dpath + "/" + strings.Split(path, "/")[2]
 }
