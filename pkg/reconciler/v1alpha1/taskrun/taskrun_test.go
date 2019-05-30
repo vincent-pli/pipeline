@@ -15,6 +15,7 @@ package taskrun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -39,10 +40,13 @@ import (
 	"github.com/tektoncd/pipeline/test/names"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
+	k8sapierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8sruntimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -192,7 +196,7 @@ func getTaskRunController(t *testing.T, d test.Data) test.TestAssets {
 	configMapWatcher := configmap.NewInformedWatcher(c.Kube, system.GetNamespace())
 	stopCh := make(chan struct{})
 	logger := zap.New(observer).Sugar()
-	th := reconciler.NewTimeoutHandler(c.Kube, c.Pipeline, stopCh, logger)
+	th := reconciler.NewTimeoutHandler(stopCh, logger)
 	return test.TestAssets{
 		Controller: NewController(
 			reconciler.Options{
@@ -304,6 +308,13 @@ func TestReconcile(t *testing.T) {
 		),
 	)
 
+	taskRunWithAnnotations := tb.TaskRun("test-taskrun-with-annotations", "foo",
+		tb.TaskRunAnnotation("TaskRunAnnotation", "TaskRunValue"),
+		tb.TaskRunSpec(
+			tb.TaskRunTaskRef(simpleTask.Name),
+		),
+	)
+
 	taskRunWithResourceRequests := tb.TaskRun("test-taskrun-with-resource-requests", "foo",
 		tb.TaskRunSpec(
 			tb.TaskRunTaskSpec(
@@ -347,7 +358,7 @@ func TestReconcile(t *testing.T) {
 		taskRunSuccess, taskRunWithSaSuccess,
 		taskRunTemplating, taskRunInputOutput,
 		taskRunWithTaskSpec, taskRunWithClusterTask, taskRunWithResourceSpecAndTaskSpec,
-		taskRunWithLabels, taskRunWithResourceRequests, taskRunTaskEnv, taskRunWithPod,
+		taskRunWithLabels, taskRunWithAnnotations, taskRunWithResourceRequests, taskRunTaskEnv, taskRunWithPod,
 	}
 
 	d := test.Data{
@@ -846,6 +857,42 @@ func TestReconcile(t *testing.T) {
 			),
 		),
 	}, {
+		name:    "taskrun-with-annotations",
+		taskRun: taskRunWithAnnotations,
+		wantPod: tb.Pod("test-taskrun-with-annotations-pod-123456", "foo",
+			tb.PodAnnotation("sidecar.istio.io/inject", "false"),
+			tb.PodAnnotation("TaskRunAnnotation", "TaskRunValue"),
+			tb.PodLabel(taskNameLabelKey, "test-task"),
+			tb.PodLabel(taskRunNameLabelKey, "test-taskrun-with-annotations"),
+			tb.PodOwnerReference("TaskRun", "test-taskrun-with-annotations",
+				tb.OwnerReferenceAPIVersion(currentApiVersion)),
+			tb.PodSpec(
+				tb.PodVolumes(toolsVolume, workspaceVolume, homeVolume),
+				tb.PodRestartPolicy(corev1.RestartPolicyNever),
+				getCredentialsInitContainer("9l9zj"),
+				getPlaceToolsInitContainer(),
+				tb.PodContainer("build-step-simple-step", "foo",
+					tb.Command(entrypointLocation),
+					tb.Args("-wait_file", "", "-post_file", "/builder/tools/0", "-entrypoint", "/mycmd", "--"),
+					tb.WorkingDir(workspaceDir),
+					tb.EnvVar("HOME", "/builder/home"),
+					tb.VolumeMount("tools", "/builder/tools"),
+					tb.VolumeMount("workspace", workspaceDir),
+					tb.VolumeMount("home", "/builder/home"),
+					tb.Resources(tb.Requests(
+						tb.CPU("0"),
+						tb.Memory("0"),
+						tb.EphemeralStorage("0"),
+					)),
+				),
+				tb.PodContainer("nop", "override-with-nop:latest",
+					tb.Command("/builder/tools/entrypoint"),
+					tb.Args("-wait_file", "/builder/tools/0", "-post_file", "/builder/tools/1", "-entrypoint", "/ko-app/nop", "--"),
+					tb.VolumeMount(entrypoint.MountName, entrypoint.MountPoint),
+				),
+			),
+		),
+	}, {
 		name:    "task-env",
 		taskRun: taskRunTaskEnv,
 		wantPod: tb.Pod("test-taskrun-task-env-pod-311bc9", "foo",
@@ -1182,7 +1229,7 @@ func TestReconcilePodFetchError(t *testing.T) {
 	clients.Kube.PrependReactor("*", "*", func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 		if action.GetVerb() == "get" && action.GetResource().Resource == "pods" {
 			// handled fetching pods
-			return true, nil, fmt.Errorf("induce failure fetching pods")
+			return true, nil, xerrors.New("induce failure fetching pods")
 		}
 		return false, nil, nil
 	})
@@ -1793,6 +1840,69 @@ func TestUpdateStatusFromPod(t *testing.T) {
 			}
 			if tr.Status.StartTime.Time != c.want.StartTime.Time {
 				t.Errorf("Expected TaskRun startTime to be unchanged but was %s", tr.Status.StartTime)
+			}
+		})
+	}
+}
+
+func TestHandlePodCreationError(t *testing.T) {
+	taskRun := tb.TaskRun("test-taskrun-pod-creation-failed", "foo", tb.TaskRunSpec(
+		tb.TaskRunTaskRef(simpleTask.Name),
+	), tb.TaskRunStatus(
+		tb.TaskRunStartTime(time.Now()),
+		tb.Condition(apis.Condition{
+			Type:   apis.ConditionSucceeded,
+			Status: corev1.ConditionUnknown,
+		}),
+	))
+	d := test.Data{
+		TaskRuns: []*v1alpha1.TaskRun{taskRun},
+		Tasks:    []*v1alpha1.Task{simpleTask},
+	}
+	testAssets := getTaskRunController(t, d)
+	c, ok := testAssets.Controller.Reconciler.(*Reconciler)
+	if !ok {
+		t.Errorf("failed to construct instance of taskrun reconciler")
+		return
+	}
+
+	// Prevent backoff timer from starting
+	c.timeoutHandler.SetTaskRunCallbackFunc(nil)
+
+	testcases := []struct {
+		description    string
+		err            error
+		expectedType   apis.ConditionType
+		expectedStatus corev1.ConditionStatus
+		expectedReason string
+	}{
+		{
+			description:    "exceeded quota errors are surfaced in taskrun condition but do not fail taskrun",
+			err:            k8sapierrors.NewForbidden(k8sruntimeschema.GroupResource{Group: "foo", Resource: "bar"}, "baz", errors.New("exceeded quota")),
+			expectedType:   apis.ConditionSucceeded,
+			expectedStatus: corev1.ConditionUnknown,
+			expectedReason: reasonExceededResourceQuota,
+		},
+		{
+			description:    "errors other than exceeded quota fail the taskrun",
+			err:            errors.New("this is a fatal error"),
+			expectedType:   apis.ConditionSucceeded,
+			expectedStatus: corev1.ConditionFalse,
+			expectedReason: reasonCouldntGetTask,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.description, func(t *testing.T) {
+			c.handlePodCreationError(taskRun, tc.err)
+			foundCondition := false
+			for _, cond := range taskRun.Status.Conditions {
+				if cond.Type == tc.expectedType && cond.Status == tc.expectedStatus && cond.Reason == tc.expectedReason {
+					foundCondition = true
+					break
+				}
+			}
+			if !foundCondition {
+				t.Errorf("expected to find condition type %q, status %q and reason %q", tc.expectedType, tc.expectedStatus, tc.expectedReason)
 			}
 		})
 	}

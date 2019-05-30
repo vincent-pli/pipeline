@@ -17,9 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"fmt"
-
 	"github.com/knative/pkg/apis"
+	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -102,7 +101,9 @@ type TaskResource struct {
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// PipelineResource is the Schema for the pipelineResources API
+// PipelineResource describes a resource that is an input to or output from a
+// Task.
+//
 // +k8s:openapi-gen=true
 type PipelineResource struct {
 	metav1.TypeMeta `json:",inline"`
@@ -170,5 +171,5 @@ func ResourceFromType(r *PipelineResource) (PipelineResourceInterface, error) {
 	case PipelineResourceTypeStorage:
 		return NewStorageResource(r)
 	}
-	return nil, fmt.Errorf("%s is an invalid or unimplemented PipelineResource", r.Spec.Type)
+	return nil, xerrors.Errorf("%s is an invalid or unimplemented PipelineResource", r.Spec.Type)
 }

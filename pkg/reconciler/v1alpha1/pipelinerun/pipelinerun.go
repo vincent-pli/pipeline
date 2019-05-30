@@ -37,6 +37,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/reconciler/v1alpha1/pipelinerun/resources"
 	"github.com/tektoncd/pipeline/pkg/reconciler/v1alpha1/taskrun"
 	"go.uber.org/zap"
+	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -216,11 +217,11 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 		return err
 	}
 	// Since we are using the status subresource, it is not possible to update
-	// the status and labels simultaneously.
-	if !reflect.DeepEqual(original.ObjectMeta.Labels, pr.ObjectMeta.Labels) {
-		if _, err := c.updateLabels(pr); err != nil {
-			c.Logger.Warn("Failed to update PipelineRun labels", zap.Error(err))
-			c.Recorder.Event(pr, corev1.EventTypeWarning, eventReasonFailed, "PipelineRun failed to update labels")
+	// the status and labels/annotations simultaneously.
+	if !reflect.DeepEqual(original.ObjectMeta.Labels, pr.ObjectMeta.Labels) || !reflect.DeepEqual(original.ObjectMeta.Annotations, pr.ObjectMeta.Annotations) {
+		if _, err := c.updateLabelsAndAnnotations(pr); err != nil {
+			c.Logger.Warn("Failed to update PipelineRun labels/annotations", zap.Error(err))
+			c.Recorder.Event(pr, corev1.EventTypeWarning, eventReasonFailed, "PipelineRun failed to update labels/annotations")
 			return err
 		}
 	}
@@ -280,6 +281,14 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1alpha1.PipelineRun) er
 		pr.ObjectMeta.Labels[key] = value
 	}
 	pr.ObjectMeta.Labels[pipeline.GroupName+pipeline.PipelineLabelKey] = p.Name
+
+	// Propagate annotations from Pipeline to PipelineRun.
+	if pr.ObjectMeta.Annotations == nil {
+		pr.ObjectMeta.Annotations = make(map[string]string, len(p.ObjectMeta.Annotations))
+	}
+	for key, value := range p.ObjectMeta.Annotations {
+		pr.ObjectMeta.Annotations[key] = value
+	}
 
 	pipelineState, err := resources.ResolvePipelineRun(
 		*pr,
@@ -382,7 +391,7 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1alpha1.PipelineRun) er
 			rprt.TaskRun, err = c.createTaskRun(c.Logger, rprt, pr, as.StorageBasePath(pr))
 			if err != nil {
 				c.Recorder.Eventf(pr, corev1.EventTypeWarning, "TaskRunCreationFailed", "Failed to create TaskRun %q: %v", rprt.TaskRunName, err)
-				return fmt.Errorf("error creating TaskRun called %s for PipelineTask %s from PipelineRun %s: %s", rprt.TaskRunName, rprt.PipelineTask.Name, pr.Name, err)
+				return xerrors.Errorf("error creating TaskRun called %s for PipelineTask %s from PipelineRun %s: %w", rprt.TaskRunName, rprt.PipelineTask.Name, pr.Name, err)
 			}
 		}
 	}
@@ -419,7 +428,7 @@ func (c *Reconciler) updateTaskRunsStatusDirectly(pr *v1alpha1.PipelineRun) erro
 		if err != nil {
 			// If the TaskRun isn't found, it just means it won't be run
 			if !errors.IsNotFound(err) {
-				return fmt.Errorf("error retrieving TaskRun %s: %s", taskRunName, err)
+				return xerrors.Errorf("error retrieving TaskRun %s: %w", taskRunName, err)
 			}
 		} else {
 			prtrs.Status = &tr.Status
@@ -455,6 +464,12 @@ func (c *Reconciler) createTaskRun(logger *zap.SugaredLogger, rprt *resources.Re
 	}
 	labels[pipeline.GroupName+pipeline.PipelineRunLabelKey] = pr.Name
 
+	// Propagate annotations from PipelineRun to TaskRun.
+	annotations := make(map[string]string, len(pr.ObjectMeta.Annotations)+1)
+	for key, val := range pr.ObjectMeta.Annotations {
+		annotations[key] = val
+	}
+
 	tr, _ := c.taskRunLister.TaskRuns(pr.Namespace).Get(rprt.TaskRunName)
 
 	if tr != nil {
@@ -473,6 +488,7 @@ func (c *Reconciler) createTaskRun(logger *zap.SugaredLogger, rprt *resources.Re
 			Namespace:       pr.Namespace,
 			OwnerReferences: pr.GetOwnerReference(),
 			Labels:          labels,
+			Annotations:     annotations,
 		},
 		Spec: v1alpha1.TaskRunSpec{
 			TaskRef: &v1alpha1.TaskRef{
@@ -509,7 +525,7 @@ func clearStatus(tr *v1alpha1.TaskRun) {
 func (c *Reconciler) updateStatus(pr *v1alpha1.PipelineRun) (*v1alpha1.PipelineRun, error) {
 	newPr, err := c.pipelineRunLister.PipelineRuns(pr.Namespace).Get(pr.Name)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting PipelineRun %s when updating status: %s", pr.Name, err)
+		return nil, xerrors.Errorf("Error getting PipelineRun %s when updating status: %w", pr.Name, err)
 	}
 	succeeded := pr.Status.GetCondition(apis.ConditionSucceeded)
 	if succeeded.Status == corev1.ConditionFalse || succeeded.Status == corev1.ConditionTrue {
@@ -524,13 +540,14 @@ func (c *Reconciler) updateStatus(pr *v1alpha1.PipelineRun) (*v1alpha1.PipelineR
 	return newPr, nil
 }
 
-func (c *Reconciler) updateLabels(pr *v1alpha1.PipelineRun) (*v1alpha1.PipelineRun, error) {
+func (c *Reconciler) updateLabelsAndAnnotations(pr *v1alpha1.PipelineRun) (*v1alpha1.PipelineRun, error) {
 	newPr, err := c.pipelineRunLister.PipelineRuns(pr.Namespace).Get(pr.Name)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting PipelineRun %s when updating labels: %s", pr.Name, err)
+		return nil, xerrors.Errorf("Error getting PipelineRun %s when updating labels/annotations: %w", pr.Name, err)
 	}
-	if !reflect.DeepEqual(pr.ObjectMeta.Labels, newPr.ObjectMeta.Labels) {
+	if !reflect.DeepEqual(pr.ObjectMeta.Labels, newPr.ObjectMeta.Labels) || !reflect.DeepEqual(pr.ObjectMeta.Annotations, newPr.ObjectMeta.Annotations) {
 		newPr.ObjectMeta.Labels = pr.ObjectMeta.Labels
+		newPr.ObjectMeta.Annotations = pr.ObjectMeta.Annotations
 		return c.PipelineClientSet.TektonV1alpha1().PipelineRuns(pr.Namespace).Update(newPr)
 	}
 	return newPr, nil

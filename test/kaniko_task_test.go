@@ -29,6 +29,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	knativetest "github.com/knative/pkg/test"
+	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -72,7 +73,7 @@ func getTask(repo, namespace string, withSecretConfig bool) *v1alpha1.Task {
 			},
 		})))
 	}
-	step := tb.Step("kaniko", "gcr.io/kaniko-project/executor", stepOps...)
+	step := tb.Step("kaniko", "gcr.io/kaniko-project/executor:v0.9.0", stepOps...)
 	taskSpecOps = append(taskSpecOps, step)
 
 	return tb.Task(kanikoTaskName, namespace, tb.TaskSpec(taskSpecOps...))
@@ -192,15 +193,15 @@ func getAllLogsFromPod(c kubernetes.Interface, pod, namespace string) (string, e
 func getRemoteDigest(image string) (string, error) {
 	ref, err := name.ParseReference(image, name.WeakValidation)
 	if err != nil {
-		return "", fmt.Errorf("could not parse image reference %q: %v", image, err)
+		return "", xerrors.Errorf("could not parse image reference %q: %w", image, err)
 	}
 	img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
-		return "", fmt.Errorf("could not pull remote ref %s: %v", ref, err)
+		return "", xerrors.Errorf("could not pull remote ref %s: %w", ref, err)
 	}
 	digest, err := img.Digest()
 	if err != nil {
-		return "", fmt.Errorf("could not get digest for image %s: %v", img, err)
+		return "", xerrors.Errorf("could not get digest for image %s: %w", img, err)
 	}
 	return digest.String(), nil
 }

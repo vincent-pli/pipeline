@@ -34,6 +34,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/reconciler/v1alpha1/taskrun/entrypoint"
 	"github.com/tektoncd/pipeline/pkg/reconciler/v1alpha1/taskrun/resources"
 	"go.uber.org/zap"
+	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -197,10 +198,10 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 		return err
 	}
 	// Since we are using the status subresource, it is not possible to update
-	// the status and labels simultaneously.
+	// the status and labels/annotations simultaneously.
 	if !reflect.DeepEqual(original.ObjectMeta.Labels, tr.ObjectMeta.Labels) {
-		if _, err := c.updateLabels(tr); err != nil {
-			c.Logger.Warn("Failed to update TaskRun labels", zap.Error(err))
+		if _, err := c.updateLabelsAndAnnotations(tr); err != nil {
+			c.Logger.Warn("Failed to update TaskRun labels/annotations", zap.Error(err))
 			return err
 		}
 	}
@@ -264,6 +265,14 @@ func (c *Reconciler) reconcile(ctx context.Context, tr *v1alpha1.TaskRun) error 
 		tr.ObjectMeta.Labels[pipeline.GroupName+pipeline.TaskLabelKey] = taskMeta.Name
 	}
 
+	// Propagate annotations from Task to TaskRun.
+	if tr.ObjectMeta.Annotations == nil {
+		tr.ObjectMeta.Annotations = make(map[string]string, len(taskMeta.Annotations))
+	}
+	for key, value := range taskMeta.Annotations {
+		tr.ObjectMeta.Annotations[key] = value
+	}
+
 	// Check if the TaskRun has timed out; if it is, this will set its status
 	// accordingly.
 	if timedOut, err := c.checkTimeout(tr, taskSpec, c.KubeClientSet.CoreV1().Pods(tr.Namespace).Delete); err != nil {
@@ -302,30 +311,9 @@ func (c *Reconciler) reconcile(ctx context.Context, tr *v1alpha1.TaskRun) error 
 		return err
 	}
 	if pod == nil {
-		// Pod is not present, create pod.
-		pod, err = c.createPod(tr, rtr.TaskSpec, rtr.TaskName)
+		pod, err = c.createPod(tr, rtr)
 		if err != nil {
-			// This Run has failed, so we need to mark it as failed and stop reconciling it
-			var reason, msg string
-			if isExceededResourceQuotaError(err) {
-				reason = reasonExceededResourceQuota
-				msg = getExceededResourcesMessage(tr)
-			} else {
-				reason = reasonCouldntGetTask
-				if tr.Spec.TaskRef != nil {
-					msg = fmt.Sprintf("Missing or invalid Task %s/%s", tr.Namespace, tr.Spec.TaskRef.Name)
-				} else {
-					msg = fmt.Sprintf("Invalid TaskSpec")
-				}
-			}
-			tr.Status.SetCondition(&apis.Condition{
-				Type:    apis.ConditionSucceeded,
-				Status:  corev1.ConditionFalse,
-				Reason:  reason,
-				Message: fmt.Sprintf("%s: %v", msg, err),
-			})
-			c.Recorder.Eventf(tr, corev1.EventTypeWarning, "BuildCreationFailed", "Failed to create build pod %q: %v", tr.Name, err)
-			c.Logger.Errorf("Failed to create build pod for task %q :%v", err, tr.Name)
+			c.handlePodCreationError(tr, err)
 			return nil
 		}
 		go c.timeoutHandler.WaitTaskRun(tr, tr.Status.StartTime)
@@ -416,6 +404,36 @@ func updateStatusFromPod(taskRun *v1alpha1.TaskRun, pod *corev1.Pod, resourceLis
 	updateTaskRunResourceResult(taskRun, pod, resourceLister, kubeclient, logger)
 }
 
+func (c *Reconciler) handlePodCreationError(tr *v1alpha1.TaskRun, err error) {
+	var reason, msg string
+	var succeededStatus corev1.ConditionStatus
+	if isExceededResourceQuotaError(err) {
+		succeededStatus = corev1.ConditionUnknown
+		reason = reasonExceededResourceQuota
+		backoff, currentlyBackingOff := c.timeoutHandler.GetBackoff(tr)
+		if !currentlyBackingOff {
+			go c.timeoutHandler.SetTaskRunTimer(tr, time.Until(backoff.NextAttempt))
+		}
+		msg = fmt.Sprintf("%s, reattempted %d times", getExceededResourcesMessage(tr), backoff.NumAttempts)
+	} else {
+		succeededStatus = corev1.ConditionFalse
+		reason = reasonCouldntGetTask
+		if tr.Spec.TaskRef != nil {
+			msg = fmt.Sprintf("Missing or invalid Task %s/%s", tr.Namespace, tr.Spec.TaskRef.Name)
+		} else {
+			msg = fmt.Sprintf("Invalid TaskSpec")
+		}
+	}
+	tr.Status.SetCondition(&apis.Condition{
+		Type:    apis.ConditionSucceeded,
+		Status:  succeededStatus,
+		Reason:  reason,
+		Message: fmt.Sprintf("%s: %v", msg, err),
+	})
+	c.Recorder.Eventf(tr, corev1.EventTypeWarning, "BuildCreationFailed", "Failed to create build pod %q: %v", tr.Name, err)
+	c.Logger.Errorf("Failed to create build pod for task %q: %v", tr.Name, err)
+}
+
 func updateTaskRunResourceResult(taskRun *v1alpha1.TaskRun, pod *corev1.Pod, resourceLister listers.PipelineResourceLister, kubeclient kubernetes.Interface, logger *zap.SugaredLogger) {
 	if resources.TaskRunHasOutputImageResource(resourceLister.PipelineResources(taskRun.Namespace).Get, taskRun) && taskRun.IsSuccessful() {
 		for _, container := range pod.Spec.Containers {
@@ -482,7 +500,7 @@ func getFailureMessage(pod *corev1.Pod) string {
 func (c *Reconciler) updateStatus(taskrun *v1alpha1.TaskRun) (*v1alpha1.TaskRun, error) {
 	newtaskrun, err := c.taskRunLister.TaskRuns(taskrun.Namespace).Get(taskrun.Name)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting TaskRun %s when updating status: %s", taskrun.Name, err)
+		return nil, xerrors.Errorf("Error getting TaskRun %s when updating status: %w", taskrun.Name, err)
 	}
 	if !reflect.DeepEqual(taskrun.Status, newtaskrun.Status) {
 		newtaskrun.Status = taskrun.Status
@@ -491,36 +509,49 @@ func (c *Reconciler) updateStatus(taskrun *v1alpha1.TaskRun) (*v1alpha1.TaskRun,
 	return newtaskrun, nil
 }
 
-func (c *Reconciler) updateLabels(tr *v1alpha1.TaskRun) (*v1alpha1.TaskRun, error) {
+func (c *Reconciler) updateLabelsAndAnnotations(tr *v1alpha1.TaskRun) (*v1alpha1.TaskRun, error) {
 	newTr, err := c.taskRunLister.TaskRuns(tr.Namespace).Get(tr.Name)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting TaskRun %s when updating labels: %s", tr.Name, err)
+		return nil, xerrors.Errorf("Error getting TaskRun %s when updating labels/annotations: %w", tr.Name, err)
 	}
-	if !reflect.DeepEqual(tr.ObjectMeta.Labels, newTr.ObjectMeta.Labels) {
+	if !reflect.DeepEqual(tr.ObjectMeta.Labels, newTr.ObjectMeta.Labels) || !reflect.DeepEqual(tr.ObjectMeta.Annotations, newTr.ObjectMeta.Annotations) {
 		newTr.ObjectMeta.Labels = tr.ObjectMeta.Labels
+		newTr.ObjectMeta.Annotations = tr.ObjectMeta.Annotations
 		return c.PipelineClientSet.TektonV1alpha1().TaskRuns(tr.Namespace).Update(newTr)
 	}
 	return newTr, nil
 }
 
-// createPod creates a Pod based on the Task's configuration, with pvcName as a
-// volumeMount
-func (c *Reconciler) createPod(tr *v1alpha1.TaskRun, ts *v1alpha1.TaskSpec, taskName string) (*corev1.Pod, error) {
-	ts = ts.DeepCopy()
+// createPod creates a Pod based on the Task's configuration, with pvcName as a volumeMount
+// TODO(dibyom): Refactor resource setup/templating logic to its own function in the resources package
+func (c *Reconciler) createPod(tr *v1alpha1.TaskRun, rtr *resources.ResolvedTaskResources) (*corev1.Pod, error) {
+	ts := rtr.TaskSpec.DeepCopy()
+	inputResources, err := resourceImplBinding(rtr.Inputs)
+	if err != nil {
+		c.Logger.Errorf("Failed to initialize input resources: %v", err)
+		return nil, err
+	}
+	outputResources, err := resourceImplBinding(rtr.Outputs)
+	if err != nil {
+		c.Logger.Errorf("Failed to initialize output resources: %v", err)
+		return nil, err
+	}
 
-	err := resources.AddOutputImageDigestExporter(tr, ts, c.resourceLister.PipelineResources(tr.Namespace).Get)
+	// Get actual resource
+
+	err = resources.AddOutputImageDigestExporter(tr, ts, c.resourceLister.PipelineResources(tr.Namespace).Get)
 	if err != nil {
 		c.Logger.Errorf("Failed to create a build for taskrun: %s due to output image resource error %v", tr.Name, err)
 		return nil, err
 	}
 
-	ts, err = resources.AddInputResource(c.KubeClientSet, taskName, ts, tr, c.resourceLister, c.Logger)
+	ts, err = resources.AddInputResource(c.KubeClientSet, rtr.TaskName, ts, tr, inputResources, c.Logger)
 	if err != nil {
 		c.Logger.Errorf("Failed to create a build for taskrun: %s due to input resource error %v", tr.Name, err)
 		return nil, err
 	}
 
-	err = resources.AddOutputResources(c.KubeClientSet, taskName, ts, tr, c.resourceLister, c.Logger)
+	ts, err = resources.AddOutputResources(c.KubeClientSet, rtr.TaskName, ts, tr, outputResources, c.Logger)
 	if err != nil {
 		c.Logger.Errorf("Failed to create a build for taskrun: %s due to output resource error %v", tr.Name, err)
 		return nil, err
@@ -528,7 +559,7 @@ func (c *Reconciler) createPod(tr *v1alpha1.TaskRun, ts *v1alpha1.TaskSpec, task
 
 	ts, err = createRedirectedTaskSpec(c.KubeClientSet, ts, tr, c.cache, c.Logger)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't create redirected TaskSpec: %v", err)
+		return nil, xerrors.Errorf("couldn't create redirected TaskSpec: %w", err)
 	}
 
 	var defaults []v1alpha1.TaskParam
@@ -539,18 +570,12 @@ func (c *Reconciler) createPod(tr *v1alpha1.TaskRun, ts *v1alpha1.TaskSpec, task
 	ts = resources.ApplyParameters(ts, tr, defaults...)
 
 	// Apply bound resource templating from the taskrun.
-	ts, err = resources.ApplyResources(ts, tr.Spec.Inputs.Resources, c.resourceLister.PipelineResources(tr.Namespace).Get, "inputs")
-	if err != nil {
-		return nil, fmt.Errorf("couldnt apply input resource templating: %s", err)
-	}
-	ts, err = resources.ApplyResources(ts, tr.Spec.Outputs.Resources, c.resourceLister.PipelineResources(tr.Namespace).Get, "outputs")
-	if err != nil {
-		return nil, fmt.Errorf("couldnt apply output resource templating: %s", err)
-	}
+	ts = resources.ApplyResources(ts, inputResources, "inputs")
+	ts = resources.ApplyResources(ts, outputResources, "outputs")
 
 	pod, err := resources.MakePod(tr, *ts, c.KubeClientSet, c.cache, c.Logger)
 	if err != nil {
-		return nil, fmt.Errorf("translating Build to Pod: %v", err)
+		return nil, xerrors.Errorf("translating Build to Pod: %w", err)
 	}
 
 	return c.KubeClientSet.CoreV1().Pods(tr.Namespace).Create(pod)
@@ -565,7 +590,7 @@ func createRedirectedTaskSpec(kubeclient kubernetes.Interface, ts *v1alpha1.Task
 	// entrypoint which copies logs to the volume
 	err := entrypoint.RedirectSteps(cache, ts.Steps, kubeclient, tr, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to add entrypoint to steps of TaskRun %s: %v", tr.Name, err)
+		return nil, xerrors.Errorf("failed to add entrypoint to steps of TaskRun %s: %w", tr.Name, err)
 	}
 	// Add the step which will copy the entrypoint into the volume
 	// we are going to be using, so that all of the steps will have
@@ -597,9 +622,14 @@ func (c *Reconciler) checkTimeout(tr *v1alpha1.TaskRun, ts *v1alpha1.TaskSpec, d
 	c.Logger.Infof("Checking timeout for TaskRun %q (startTime %s, timeout %s, runtime %s)", tr.Name, tr.Status.StartTime, timeout, runtime)
 	if runtime > timeout {
 		c.Logger.Infof("TaskRun %q is timeout (runtime %s over %s), deleting pod", tr.Name, runtime, timeout)
-		if err := dp(tr.Status.PodName, &metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-			c.Logger.Errorf("Failed to terminate pod: %v", err)
-			return true, err
+		// tr.Status.PodName will be empty if the pod was never successfully created. This condition
+		// can be reached, for example, by the pod never being schedulable due to limits imposed by
+		// a namespace's ResourceQuota.
+		if tr.Status.PodName != "" {
+			if err := dp(tr.Status.PodName, &metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				c.Logger.Errorf("Failed to terminate pod: %v", err)
+				return true, err
+			}
 		}
 
 		timeoutMsg := fmt.Sprintf("TaskRun %q failed to finish within %q", tr.Name, timeout.String())
@@ -632,4 +662,17 @@ func isExceededResourceQuotaError(err error) bool {
 
 func getExceededResourcesMessage(tr *v1alpha1.TaskRun) string {
 	return fmt.Sprintf("TaskRun pod %q exceeded available resources", tr.Name)
+}
+
+// resourceImplBinding maps pipeline resource names to the actual resource type implementations
+func resourceImplBinding(resources map[string]*v1alpha1.PipelineResource) (map[string]v1alpha1.PipelineResourceInterface, error) {
+	p := make(map[string]v1alpha1.PipelineResourceInterface)
+	for rName, r := range resources {
+		i, err := v1alpha1.ResourceFromType(r)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to create resource %s : %v with error: %w", rName, r, err)
+		}
+		p[rName] = i
+	}
+	return p, nil
 }
