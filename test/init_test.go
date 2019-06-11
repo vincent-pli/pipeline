@@ -77,6 +77,16 @@ func tearDown(t *testing.T, cs *clients, namespace string) {
 		} else {
 			t.Log(string(bs))
 		}
+		header(t.Logf, fmt.Sprintf("Dumping logs from Pods in the %s", namespace))
+		taskruns, err := cs.TaskRunClient.List(metav1.ListOptions{})
+		if err != nil {
+			t.Errorf("Error getting TaskRun list %s", err)
+		}
+		for _, tr := range taskruns.Items {
+			if tr.Status.PodName != "" {
+				CollectPodLogs(cs, tr.Status.PodName, namespace, t.Logf)
+			}
+		}
 	}
 
 	t.Logf("Deleting namespace %s", namespace)
@@ -126,8 +136,8 @@ func verifyServiceAccountExistence(t *testing.T, namespace string, kubeClient *k
 // TestMain initializes anything global needed by the tests. Right now this is just log and metric
 // setup since the log and metric libs we're using use global state :(
 func TestMain(m *testing.M) {
-	fmt.Fprintf(os.Stderr, "Using kubeconfig at `%s` with cluster `%s`", knativetest.Flags.Kubeconfig, knativetest.Flags.Cluster)
 	c := m.Run()
+	fmt.Fprintf(os.Stderr, "Using kubeconfig at `%s` with cluster `%s`\n", knativetest.Flags.Kubeconfig, knativetest.Flags.Cluster)
 	os.Exit(c)
 }
 

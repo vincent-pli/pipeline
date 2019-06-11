@@ -82,22 +82,6 @@ type PipelineResourceStatus struct {
 var _ apis.Validatable = (*PipelineResource)(nil)
 var _ apis.Defaultable = (*PipelineResource)(nil)
 
-// TaskResource defines an input or output Resource declared as a requirement
-// by a Task. The Name field will be used to refer to these Resources within
-// the Task definition, and when provided as an Input, the Name will be the
-// path to the volume mounted containing this Resource as an input (e.g.
-// an input Resource named `workspace` will be mounted at `/workspace`).
-type TaskResource struct {
-	Name string               `json:"name"`
-	Type PipelineResourceType `json:"type"`
-	// +optional
-	// TargetPath is the path in workspace directory where the task resource will be copied.
-	TargetPath string `json:"targetPath"`
-	// +optional
-	// Path to the index.json file for output container images
-	OutputImageDir string `json:"outputImageDir"`
-}
-
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -126,21 +110,6 @@ type PipelineResourceBinding struct {
 	// ResourceRef is a reference to the instance of the actual PipelineResource
 	// that should be used
 	ResourceRef PipelineResourceRef `json:"resourceRef,omitempty"`
-}
-
-// TaskResourceBinding points to the PipelineResource that
-// will be used for the Task input or output called Name. The optional Path field
-// corresponds to a path on disk at which the Resource can be found (used when providing
-// the resource via mounted volume, overriding the default logic to fetch the Resource).
-type TaskResourceBinding struct {
-	Name string `json:"name"`
-	// no more than one of the ResourceRef and ResourceSpec may be specified.
-	// +optional
-	ResourceRef PipelineResourceRef `json:"resourceRef,omitempty"`
-	// +optional
-	ResourceSpec *PipelineResourceSpec `json:"resourceSpec,omitempty"`
-	// +optional
-	Paths []string `json:"paths,omitempty"`
 }
 
 // PipelineResourceResult used to export the image name and digest as json
