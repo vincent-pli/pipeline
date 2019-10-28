@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -29,8 +30,11 @@ import (
 )
 
 var (
-	outputResources map[string]v1alpha1.PipelineResourceInterface
+	outputResources     map[string]v1alpha1.PipelineResourceInterface
+	imageOutputResource map[string][]byte
 )
+
+const digestImage = "override-with-imagedigest-exporter-image:latest"
 
 func outputResourceSetup() {
 	logger, _ = logging.NewLogger("", "")
@@ -92,12 +96,29 @@ func outputResourceSetup() {
 	}}
 
 	outputResources = make(map[string]v1alpha1.PipelineResourceInterface)
+	imageOutputResource = make(map[string][]byte)
 	for _, r := range rs {
 		ri, _ := v1alpha1.ResourceFromType(r, images)
 		outputResources[r.Name] = ri
+		if r.Spec.Type == v1alpha1.PipelineResourceTypeImage {
+			ir, _ := v1alpha1.NewImageResource(digestImage, r)
+			ir.OutputImageDir = "/workspace/output/source-workspace"
+			output := []*v1alpha1.ImageResource{ir}
+			imagesJSON, _ := json.Marshal(output)
+
+			imageOutputResource[r.Name] = imagesJSON
+
+			ir.OutputImageDir = "/workspace"
+			output = []*v1alpha1.ImageResource{ir}
+			imagesJSON, _ = json.Marshal(output)
+
+			imageOutputResource[r.Name+"-targetpath"] = imagesJSON
+		}
 	}
 }
+
 func TestValidOutputResources(t *testing.T) {
+	outputResourceSetup()
 
 	for _, c := range []struct {
 		name        string
@@ -299,6 +320,14 @@ func TestValidOutputResources(t *testing.T) {
 			Image:   "override-with-bash-noop:latest",
 			Command: []string{"/ko-app/bash"},
 			Args:    []string{"-args", "mkdir -p /workspace/output/source-workspace"},
+		}}, {Container: corev1.Container{
+			Name:    "image-digest-exporter-source-image-mz4c7",
+			Image:   "override-with-imagedigest-exporter-image:latest",
+			Command: []string{"/ko-app/imagedigestexporter"},
+			Args: []string{
+				"-images", string(imageOutputResource["source-image"]),
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		}}},
 		wantVolumes: nil,
 	}, {
@@ -695,6 +724,14 @@ func TestValidOutputResources(t *testing.T) {
 			Image:   "override-with-bash-noop:latest",
 			Command: []string{"/ko-app/bash"},
 			Args:    []string{"-args", "mkdir -p /workspace/output/source-workspace"},
+		}}, {Container: corev1.Container{
+			Name:    "image-digest-exporter-source-image-mz4c7",
+			Image:   "override-with-imagedigest-exporter-image:latest",
+			Command: []string{"/ko-app/imagedigestexporter"},
+			Args: []string{
+				"-images", string(imageOutputResource["source-image"]),
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		}}},
 	}, {
 		name: "Resource with TargetPath as output",
@@ -742,6 +779,14 @@ func TestValidOutputResources(t *testing.T) {
 			Image:   "override-with-bash-noop:latest",
 			Command: []string{"/ko-app/bash"},
 			Args:    []string{"-args", "mkdir -p /workspace"},
+		}}, {Container: corev1.Container{
+			Name:    "image-digest-exporter-source-image-mz4c7",
+			Image:   "override-with-imagedigest-exporter-image:latest",
+			Command: []string{"/ko-app/imagedigestexporter"},
+			Args: []string{
+				"-images", string(imageOutputResource["source-image-targetpath"]),
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		}}},
 	}, {
 		desc: "image output resource with no steps",
@@ -783,6 +828,14 @@ func TestValidOutputResources(t *testing.T) {
 			Image:   "override-with-bash-noop:latest",
 			Command: []string{"/ko-app/bash"},
 			Args:    []string{"-args", "mkdir -p /workspace/output/source-workspace"},
+		}}, {Container: corev1.Container{
+			Name:    "image-digest-exporter-source-image-mz4c7",
+			Image:   "override-with-imagedigest-exporter-image:latest",
+			Command: []string{"/ko-app/imagedigestexporter"},
+			Args: []string{
+				"-images", string(imageOutputResource["source-image"]),
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		}}},
 	}} {
 		t.Run(c.name, func(t *testing.T) {

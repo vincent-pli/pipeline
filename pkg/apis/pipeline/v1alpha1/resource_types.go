@@ -217,7 +217,7 @@ func ResourceFromType(r *PipelineResource, images pipeline.Images) (PipelineReso
 	case PipelineResourceTypeGit:
 		return NewGitResource(images.GitImage, r)
 	case PipelineResourceTypeImage:
-		return NewImageResource(r)
+		return NewImageResource(images.ImageDigestExporterImage, r)
 	case PipelineResourceTypeCluster:
 		return NewClusterResource(images.KubeconfigWriterImage, r)
 	case PipelineResourceTypeStorage:

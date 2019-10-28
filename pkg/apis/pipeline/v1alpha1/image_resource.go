@@ -20,17 +20,22 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/tektoncd/pipeline/pkg/names"
 	"golang.org/x/xerrors"
+	corev1 "k8s.io/api/core/v1"
 )
 
+const imageDigestExporterContainerName = "image-digest-exporter-"
+
 // NewImageResource creates a new ImageResource from a PipelineResource.
-func NewImageResource(r *PipelineResource) (*ImageResource, error) {
+func NewImageResource(digestImage string, r *PipelineResource) (*ImageResource, error) {
 	if r.Spec.Type != PipelineResourceTypeImage {
 		return nil, xerrors.Errorf("ImageResource: Cannot create an Image resource from a %s Pipeline Resource", r.Spec.Type)
 	}
 	ir := &ImageResource{
-		Name: r.Name,
-		Type: PipelineResourceTypeImage,
+		Name:        r.Name,
+		Type:        PipelineResourceTypeImage,
+		DigestImage: digestImage,
 	}
 
 	for _, param := range r.Spec.Params {
@@ -52,6 +57,7 @@ type ImageResource struct {
 	URL            string               `json:"url"`
 	Digest         string               `json:"digest"`
 	OutputImageDir string
+	DigestImage    string `json:"digestImage"`
 }
 
 // GetName returns the name of the resource
@@ -80,8 +86,18 @@ func (s *ImageResource) GetInputTaskModifier(_ *TaskSpec, _ string) (TaskModifie
 }
 
 // GetOutputTaskModifier returns a No-op TaskModifier.
-func (s *ImageResource) GetOutputTaskModifier(_ *TaskSpec, _ string) (TaskModifier, error) {
-	return &InternalTaskModifier{}, nil
+func (s *ImageResource) GetOutputTaskModifier(ts *TaskSpec, sourcePath string) (TaskModifier, error) {
+	s.OutputImageDir = sourcePath
+
+	output := []*ImageResource{s}
+	imagesJSON, err := json.Marshal(output)
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to format image resource data for output image exporter: %w", err)
+	}
+
+	return &InternalTaskModifier{
+		StepsToAppend: s.getStep(imagesJSON, sourcePath),
+	}, nil
 }
 
 func (s ImageResource) String() string {
@@ -90,4 +106,16 @@ func (s ImageResource) String() string {
 	// if the Marshal func gives an error, the returned string will be empty
 	json, _ := json.Marshal(s)
 	return string(json)
+}
+
+func (s *ImageResource) getStep(imagesJSON []byte, sourcePath string) []Step {
+	return []Step{{Container: corev1.Container{
+		Name:    names.SimpleNameGenerator.RestrictLengthWithRandomSuffix(imageDigestExporterContainerName + s.Name),
+		Image:   s.DigestImage,
+		Command: []string{"/ko-app/imagedigestexporter"},
+		Args: []string{
+			"-images", string(imagesJSON),
+		},
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+	}}}
 }
