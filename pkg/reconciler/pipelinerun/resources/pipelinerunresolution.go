@@ -19,6 +19,7 @@ package resources
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -488,6 +489,7 @@ func resolveConditionChecks(pt *v1alpha1.PipelineTask, taskRunStatus map[string]
 	for i := range pt.Conditions {
 		ptc := pt.Conditions[i]
 		cName := ptc.ConditionRef
+		crName := cName + strconv.Itoa(i)
 		c, err := getCondition(cName)
 		if err != nil {
 			return nil, &ConditionNotFoundError{
@@ -495,7 +497,7 @@ func resolveConditionChecks(pt *v1alpha1.PipelineTask, taskRunStatus map[string]
 				Msg:  err.Error(),
 			}
 		}
-		conditionCheckName := getConditionCheckName(taskRunStatus, taskRunName, cName)
+		conditionCheckName := getConditionCheckName(taskRunStatus, taskRunName, crName)
 		cctr, err := getTaskRun(conditionCheckName)
 		if err != nil {
 			if !errors.IsNotFound(err) {
@@ -516,6 +518,7 @@ func resolveConditionChecks(pt *v1alpha1.PipelineTask, taskRunStatus map[string]
 		}
 
 		rcc := ResolvedConditionCheck{
+			ConditionRegisterName: crName,
 			Condition:             c,
 			ConditionCheckName:    conditionCheckName,
 			ConditionCheck:        v1alpha1.NewConditionCheck(cctr),
